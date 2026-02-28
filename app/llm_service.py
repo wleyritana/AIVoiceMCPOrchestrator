@@ -22,6 +22,10 @@ from .logging_loki import loki
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+# NEW: prompt profile selector (Railway env)
+# Set CLINICOPS_PROMPT_PROFILE=ems or hospital
+PROMPT_PROFILE = os.getenv("CLINICOPS_PROMPT_PROFILE", "hospital").strip().lower()
+
 
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
@@ -34,6 +38,68 @@ def _no_key_message(kind: str) -> str:
         "Set OPENAI_API_KEY (and optionally OPENAI_MODEL) in your Railway/GitHub environment.\n\n"
         "Example: export OPENAI_API_KEY=..."
     )
+
+
+# -------------------------------------------------------------------
+# Hospital/Doctor unified prompt (SOAP + Assessment + Plan)
+# Lightweight and chart-ready for clinician documentation.
+# -------------------------------------------------------------------
+HOSPITAL_UNIFIED_PROMPT = """
+You are a clinician-facing documentation and reasoning assistant.
+
+Convert clinician notes into a structured, chart-ready SOAP note with clinical reasoning.
+
+Language:
+- Default English.
+- Swedish only if explicitly requested.
+
+Rules:
+- Do not invent facts. If missing, write "Not provided."
+- Preserve negations and timelines.
+- Clinician-facing only.
+- No definitive medication dosing.
+- Do not repeat content between sections.
+
+Output:
+
+Title: "SOAP Note (Draft)"
+
+Sections:
+Chief Complaint
+HPI
+ROS (if present)
+PMH/PSH
+Medications
+Allergies
+Social/Family History (if present)
+Vitals
+Physical Exam
+Assessment
+Plan
+Gaps to Confirm
+
+Assessment:
+- Synthesize findings (do not restate HPI).
+- Include ranked differential (max 5, 1 sentence each).
+- Include red flags if relevant.
+
+Plan:
+- Action-oriented bullets.
+- Workup, management (no dosing), follow-up.
+
+Optional — Next Steps:
+Only if requested.
+- Max 5 bullets, ≤12 words each.
+
+Optional — Patient Summary:
+Only if requested.
+- Plain language.
+- Max 120 words.
+- No differential or internal reasoning.
+
+End with:
+Draft for clinician review.
+""".strip()
 
 
 # -------------------------------------------------------------------
@@ -104,6 +170,13 @@ Draft for clinician review.
 """.strip()
 
 
+def _get_system_prompt() -> str:
+    # NEW: profile selection (does not affect Grafana/Loki fields)
+    if PROMPT_PROFILE == "ems":
+        return EMS_UNIFIED_PROMPT
+    return HOSPITAL_UNIFIED_PROMPT
+
+
 def _run_llm(messages: list[dict], temperature: float) -> str:
     """Single place to call OpenAI; keeps the rest of the file stable."""
     completion = client.chat.completions.create(
@@ -128,9 +201,9 @@ def draft_documentation_note(
 
     start = time.perf_counter()
 
-    # Unified EMS prompt: generates SOAP + Assessment + Plan in one call
+    system_prompt = _get_system_prompt()
     messages = [
-        {"role": "system", "content": EMS_UNIFIED_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
 
@@ -142,6 +215,8 @@ def draft_documentation_note(
             "user": user_id,
             "channel": channel,
             "session_id": session_id,
+            # OPTIONAL (safe): uncomment if you want filtering by profile later
+            # "prompt_profile": PROMPT_PROFILE,
         },
         service_type="llm_service",
         sync_mode="async",
@@ -149,7 +224,6 @@ def draft_documentation_note(
         trace_id=trace_id,
     )
 
-    # Keep temperature as originally used for documentation (low variance)
     content = _run_llm(messages, temperature=0.2)
 
     latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
@@ -164,6 +238,8 @@ def draft_documentation_note(
             "session_id": session_id,
             "latency_ms": latency_ms,
             "chars": len(content),
+            # OPTIONAL (safe): uncomment if you want filtering by profile later
+            # "prompt_profile": PROMPT_PROFILE,
         },
         service_type="llm_service",
         sync_mode="async",
@@ -181,16 +257,16 @@ def draft_assessment_plan(
     session_id: str,
     trace_id: Optional[str] = None,
 ) -> str:
-    """Generate a clinician-facing draft Assessment & Plan (now unified SOAP + A&P for EMS)."""
+    """Generate a clinician-facing draft Assessment & Plan (unified SOAP + A&P)."""
 
     if client is None:
         return _no_key_message("assessment_plan")
 
     start = time.perf_counter()
 
-    # Same unified prompt to make workflow seamless and avoid repeating notes
+    system_prompt = _get_system_prompt()
     messages = [
-        {"role": "system", "content": EMS_UNIFIED_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
 
@@ -202,6 +278,8 @@ def draft_assessment_plan(
             "user": user_id,
             "channel": channel,
             "session_id": session_id,
+            # OPTIONAL (safe): uncomment if you want filtering by profile later
+            # "prompt_profile": PROMPT_PROFILE,
         },
         service_type="llm_service",
         sync_mode="async",
@@ -209,8 +287,6 @@ def draft_assessment_plan(
         trace_id=trace_id,
     )
 
-    # Keep original A&P temperature (slightly higher) OR set to 0.2 for consistency.
-    # Leaving as 0.3 preserves previous behavior (more flexible reasoning).
     content = _run_llm(messages, temperature=0.3)
 
     latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
@@ -225,6 +301,8 @@ def draft_assessment_plan(
             "session_id": session_id,
             "latency_ms": latency_ms,
             "chars": len(content),
+            # OPTIONAL (safe): uncomment if you want filtering by profile later
+            # "prompt_profile": PROMPT_PROFILE,
         },
         service_type="llm_service",
         sync_mode="async",
